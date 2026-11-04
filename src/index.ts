@@ -120,10 +120,14 @@ export async function run(): Promise<void> {
         context,
         branchName,
         prNumber,
-        originalPRTitle
+        originalPRTitle,
+        stats.missing
       );
     } else {
       core.info('No files were successfully copied, skipping PR creation');
+      if (stats.missing.length > 0) {
+        await postMissingComment(octokit, context, prNumber, stats.missing);
+      }
     }
 
   } catch (error: any) {
@@ -164,6 +168,36 @@ interface ForwardportStats {
   copied: number;
   skipped: number;
   errors: number;
+  // Main-folder paths left for manual review because they have no matching
+  // file or folder there.
+  missing: string[];
+}
+
+function posixDirname(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash === -1 ? '.' : path.substring(0, slash);
+}
+
+// True when a directory exists at the given ref. The Contents API returns an
+// array for a directory and 404 for a missing path.
+async function directoryExistsAtRef(octokit: any, context: any, path: string, ref: string): Promise<boolean> {
+  try {
+    const { data } = await octokit.rest.repos.getContent({
+      ...context.repo,
+      path,
+      ref
+    });
+    return Array.isArray(data);
+  } catch (error: any) {
+    if (error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function formatMissingList(missing: string[]): string {
+  return missing.map(f => `- \`${f}\``).join('\n');
 }
 
 // Exported for testing
@@ -177,6 +211,7 @@ export async function forwardportFiles(
   let copied = 0;
   let skipped = 0;
   let errors = 0;
+  const missing: string[] = [];
 
   for (const file of files) {
     try {
@@ -221,8 +256,30 @@ export async function forwardportFiles(
           ref: branchName
         });
         sha = existingFile.sha;
-      } catch (error) {
-        // File doesn't exist yet, which is fine
+      } catch (error: any) {
+        if (error.status !== 404) {
+          throw error;
+        }
+      }
+
+      // The versioned file has no counterpart at the same path in the main
+      // folder. After a docs restructure, the page usually lives at a
+      // different path there, and creating this one would bring the page back
+      // at its old path as a duplicate. Leave it for a person to place.
+      if (!sha) {
+        const relativeDir = posixDirname(relativePath);
+        const folderMissing = relativeDir !== '.' &&
+          !(await directoryExistsAtRef(octokit, context, `${mainFolder}/${relativeDir}`, branchName));
+        if (file.status !== 'added' || folderMissing) {
+          core.warning(
+            `${targetPath} has no matching place in the main folder (${file.status !== 'added'
+              ? 'the file does not exist there'
+              : `the folder ${mainFolder}/${relativeDir} does not exist there`}); ` +
+            `the page may live at a different path. Leaving it for manual review.`
+          );
+          missing.push(targetPath);
+          continue;
+        }
         core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
       }
 
@@ -276,10 +333,13 @@ export async function forwardportFiles(
   const stats: ForwardportStats = {
     copied,
     skipped,
-    errors
+    errors,
+    missing
   };
 
-  core.info(`Forwardport stats - Copied: ${copied}, Skipped: ${skipped}, Errors: ${errors}`);
+  core.info(
+    `Forwardport stats - Copied: ${copied}, Skipped: ${skipped}, Errors: ${errors}, Manual review: ${missing.length}`
+  );
 
   // Return the stats
   return stats;
@@ -329,16 +389,25 @@ export async function createForwardportPR(
   context: any,
   branchName: string,
   originalPRNumber: number,
-  originalPRTitle: string
+  originalPRTitle: string,
+  missing: string[] = []
 ): Promise<void> {
   // Create PR title in the format: [forwardport] original title (#original_pr_number)
   const prTitle = `[forwardport] ${originalPRTitle} (#${originalPRNumber})`;
+
+  let body = `This PR forwardports changes from versioned docs to the main documentation folder.\n\nOriginal PR: #${originalPRNumber}`;
+  if (missing.length > 0) {
+    body += `\n\n## Manual review needed\n\nThe main folder has no file or folder at the same path for the ` +
+      `following files, often because the docs were restructured after the version was cut. They were not ` +
+      `created; please forwardport the relevant changes by hand, at the main folder's own path:\n\n` +
+      formatMissingList(missing);
+  }
 
   // Create a PR
   const { data: pr } = await octokit.rest.pulls.create({
     ...context.repo,
     title: prTitle,
-    body: `This PR forwardports changes from versioned docs to the main documentation folder.\n\nOriginal PR: #${originalPRNumber}`,
+    body,
     head: branchName,
     base: context.payload.repository.default_branch
   });
@@ -351,6 +420,28 @@ export async function createForwardportPR(
   });
 
   core.info(`Created forwardport PR #${pr.number}`);
+}
+
+// Surface skipped files on the original PR when no forwardport PR is opened.
+// Exported for testing
+export async function postMissingComment(
+  octokit: any,
+  context: any,
+  originalPRNumber: number,
+  missing: string[]
+): Promise<void> {
+  const body = `The automated forwardport of this PR found no file or folder at the same path in the main ` +
+    `documentation folder for the following files, often because the docs were restructured after the version ` +
+    `was cut. They were not created; please forwardport the relevant changes by hand, at the main folder's own ` +
+    `path:\n\n` + formatMissingList(missing);
+
+  await octokit.rest.issues.createComment({
+    ...context.repo,
+    issue_number: originalPRNumber,
+    body
+  });
+
+  core.info(`Posted manual review comment on PR #${originalPRNumber}`);
 }
 
 run();
