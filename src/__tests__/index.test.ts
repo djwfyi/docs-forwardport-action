@@ -359,7 +359,14 @@ describe('Docs Forwardport Action Tests', () => {
 
     it('comments on the original PR with the files left for manual review', async () => {
       const mockOctokit = {
-        rest: { issues: { createComment: jest.fn().mockResolvedValue({ data: {} }) } }
+        paginate: jest.fn().mockResolvedValue([{ id: 1, body: 'unrelated comment' }]),
+        rest: {
+          issues: {
+            listComments: jest.fn(),
+            createComment: jest.fn().mockResolvedValue({ data: {} }),
+            updateComment: jest.fn()
+          }
+        }
       };
 
       await index.postMissingComment(
@@ -370,7 +377,139 @@ describe('Docs Forwardport Action Tests', () => {
       );
 
       expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
-        expect.objectContaining({ issue_number: 7, body: expect.stringContaining('vcluster/manage/sleep-wakeup.mdx') })
+        expect.objectContaining({
+          issue_number: 7,
+          body: expect.stringContaining('vcluster/manage/sleep-wakeup.mdx')
+        })
+      );
+      expect(mockOctokit.rest.issues.createComment.mock.calls[0][0].body).toContain(index.MANUAL_REVIEW_MARKER);
+      expect(mockOctokit.rest.issues.updateComment).not.toHaveBeenCalled();
+    });
+
+    it('updates the marked comment on a retry instead of posting it again', async () => {
+      const mockOctokit = {
+        paginate: jest.fn().mockResolvedValue([
+          { id: 99, body: `${index.MANUAL_REVIEW_MARKER}\nold list` }
+        ]),
+        rest: {
+          issues: {
+            listComments: jest.fn(),
+            createComment: jest.fn(),
+            updateComment: jest.fn().mockResolvedValue({ data: {} })
+          }
+        }
+      };
+
+      await index.postMissingComment(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' } },
+        7,
+        ['vcluster/manage/sleep-wakeup.mdx']
+      );
+
+      expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.issues.updateComment).toHaveBeenCalledWith(
+        expect.objectContaining({ comment_id: 99, body: expect.stringContaining('vcluster/manage/sleep-wakeup.mdx') })
+      );
+    });
+
+    it('leaves an up-to-date marked comment unchanged', async () => {
+      const mockOctokit: any = {
+        paginate: jest.fn(),
+        rest: {
+          issues: {
+            listComments: jest.fn(),
+            createComment: jest.fn().mockResolvedValue({ data: {} }),
+            updateComment: jest.fn()
+          }
+        }
+      };
+      const ctx = { repo: { owner: 'test', repo: 'test' } };
+      const missing = ['vcluster/manage/sleep-wakeup.mdx'];
+
+      mockOctokit.paginate.mockResolvedValueOnce([]);
+      await index.postMissingComment(mockOctokit, ctx, 7, missing);
+      const posted = mockOctokit.rest.issues.createComment.mock.calls[0][0].body;
+
+      mockOctokit.paginate.mockResolvedValueOnce([{ id: 5, body: posted }]);
+      await index.postMissingComment(mockOctokit, ctx, 7, missing);
+
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.issues.updateComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('run() failure handling', () => {
+    let mockCore: any;
+    let mockGithub: any;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+
+      mockCore = require('@actions/core');
+      mockGithub = require('@actions/github');
+
+      mockCore.getInput.mockReturnValue('fake-token');
+    });
+
+    it('fails the run and opens no PR when a target lookup fails', async () => {
+
+      const error500 = Object.assign(new Error('Server Error'), { status: 500 });
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            listFiles: jest.fn().mockResolvedValue({
+              data: [
+                { filename: 'vcluster_versioned_docs/version-0.37.0/guide.mdx', status: 'modified' },
+                { filename: 'vcluster_versioned_docs/version-0.37.0/intro.mdx', status: 'modified' }
+              ]
+            }),
+            list: jest.fn().mockResolvedValue({ data: [] }),
+            create: jest.fn().mockResolvedValue({ data: { number: 456 } })
+          },
+          repos: {
+            get: jest.fn().mockResolvedValue({ data: { default_branch: 'main' } }),
+            getContent: jest.fn().mockImplementation(({ path }: any) => {
+              if (path === 'vcluster/guide.mdx') {
+                return Promise.reject(error500);
+              }
+              return Promise.resolve({
+                data: { content: Buffer.from('content').toString('base64'), sha: 'sha' }
+              });
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          },
+          git: {
+            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'main-sha' } } }),
+            createRef: jest.fn().mockResolvedValue({})
+          },
+          issues: {
+            addLabels: jest.fn().mockResolvedValue({}),
+            createComment: jest.fn()
+          }
+        }
+      };
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      mockGithub.context = {
+        payload: {
+          action: 'closed',
+          pull_request: {
+            number: 7,
+            merged: true,
+            labels: [{ name: 'forwardport-main' }],
+            head: { sha: 'head-sha' },
+            title: 'Fix guide'
+          },
+          repository: { default_branch: 'main' }
+        },
+        repo: { owner: 'test', repo: 'test' }
+      };
+
+      await index.run();
+
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(
+        expect.stringContaining('Forwardport failed for 1 file(s); no pull request was created')
       );
     });
   });

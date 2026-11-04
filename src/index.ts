@@ -109,6 +109,17 @@ export async function run(): Promise<void> {
       branchName
     );
 
+    // Never open a partial forwardport PR when a file failed to process, for
+    // example because a target lookup returned 403 or 500. An open PR would
+    // also block a retry, because the duplicate check finds it. The per-file
+    // warnings remain in the job log, and failing the run makes the
+    // incomplete forwardport impossible to overlook.
+    if (stats.errors > 0) {
+      throw new Error(
+        `Forwardport failed for ${stats.errors} file(s); no pull request was created`
+      );
+    }
+
     // Only create a PR if we successfully copied at least one file
     if (stats.copied > 0) {
       // Get original PR title
@@ -422,6 +433,10 @@ export async function createForwardportPR(
   core.info(`Created forwardport PR #${pr.number}`);
 }
 
+// Hidden marker that identifies this action's manual-review comment, so a
+// retry updates it instead of posting the same list again.
+export const MANUAL_REVIEW_MARKER = '<!-- docs-forwardport-action:manual-review -->';
+
 // Surface skipped files on the original PR when no forwardport PR is opened.
 // Exported for testing
 export async function postMissingComment(
@@ -430,10 +445,31 @@ export async function postMissingComment(
   originalPRNumber: number,
   missing: string[]
 ): Promise<void> {
-  const body = `The automated forwardport of this PR found no file or folder at the same path in the main ` +
+  const body = `${MANUAL_REVIEW_MARKER}\nThe automated forwardport of this PR found no file or folder at the same path in the main ` +
     `documentation folder for the following files, often because the docs were restructured after the version ` +
     `was cut. They were not created; please forwardport the relevant changes by hand, at the main folder's own ` +
     `path:\n\n` + formatMissingList(missing);
+
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+    ...context.repo,
+    issue_number: originalPRNumber,
+    per_page: 100
+  });
+  const existing = comments.find((comment: any) => comment.body?.includes(MANUAL_REVIEW_MARKER));
+
+  if (existing) {
+    if (existing.body !== body) {
+      await octokit.rest.issues.updateComment({
+        ...context.repo,
+        comment_id: existing.id,
+        body
+      });
+      core.info(`Updated manual review comment on PR #${originalPRNumber}`);
+    } else {
+      core.info(`Manual review comment on PR #${originalPRNumber} is already up to date`);
+    }
+    return;
+  }
 
   await octokit.rest.issues.createComment({
     ...context.repo,
