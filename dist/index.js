@@ -30170,12 +30170,12 @@ async function forwardportFiles(octokit, context, files, branchName) {
             // at its old path as a duplicate. Leave it for a person to place.
             if (!sha) {
                 const relativeDir = posixDirname(relativePath);
-                const folderMissing = relativeDir !== '.' &&
-                    !(await directoryExistsAtRef(octokit, context, `${mainFolder}/${relativeDir}`, branchName));
+                const targetDir = relativeDir === '.' ? mainFolder : `${mainFolder}/${relativeDir}`;
+                const folderMissing = !(await directoryExistsAtRef(octokit, context, targetDir, branchName));
                 if (file.status !== 'added' || folderMissing) {
                     core.warning(`${targetPath} has no matching place in the main folder (${file.status !== 'added'
                         ? 'the file does not exist there'
-                        : `the folder ${mainFolder}/${relativeDir} does not exist there`}); ` +
+                        : `the folder ${targetDir} does not exist there`}); ` +
                         `the page may live at a different path. Leaving it for manual review.`);
                     missing.push(targetPath);
                     continue;

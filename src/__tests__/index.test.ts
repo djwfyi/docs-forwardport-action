@@ -180,7 +180,8 @@ describe('Docs Forwardport Action Tests', () => {
           repos: {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [{ type: 'file', path: 'vcluster/existing.mdx' }] }),
             createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({})
           }
         }
@@ -304,6 +305,42 @@ describe('Docs Forwardport Action Tests', () => {
       );
     });
 
+    it.each([
+      ['vcluster_versioned_docs', 'vcluster'],
+      ['platform_versioned_docs', 'platform']
+    ])('checks the main root for an added %s page', async (versionedFolder, mainFolder) => {
+      const getContent = jest.fn().mockImplementation(({ path }: any) => {
+        if (path.startsWith(versionedFolder + '/')) {
+          return Promise.resolve({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } });
+        }
+        return Promise.reject({ status: 404 });
+      });
+      const createOrUpdateFileContents = jest.fn().mockResolvedValue({});
+      const mockOctokit = { rest: { repos: { getContent, createOrUpdateFileContents } } };
+      const context = { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } };
+      const files = [{ filename: `${versionedFolder}/version-0.37.0/new-page.mdx`, status: 'added' }];
+
+      const missing = await index.forwardportFiles(mockOctokit, context, files, 'forwardport/branch');
+
+      expect(missing.copied).toBe(0);
+      expect(missing.missing).toEqual([`${mainFolder}/new-page.mdx`]);
+      expect(createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(getContent).toHaveBeenCalledWith(expect.objectContaining({ path: mainFolder, ref: 'forwardport/branch' }));
+
+      getContent.mockImplementation(({ path }: any) => {
+        if (path === mainFolder) return Promise.resolve({ data: [{ type: 'file', path: `${mainFolder}/existing.mdx` }] });
+        if (path.startsWith(versionedFolder + '/')) {
+          return Promise.resolve({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } });
+        }
+        return Promise.reject({ status: 404 });
+      });
+      const existing = await index.forwardportFiles(mockOctokit, context, files, 'forwardport/branch');
+
+      expect(existing.copied).toBe(1);
+      expect(existing.missing).toEqual([]);
+      expect(createOrUpdateFileContents).toHaveBeenCalledWith(expect.objectContaining({ path: `${mainFolder}/new-page.mdx` }));
+    });
+
     it('retries on SHA conflict', async () => {
       const error409 = new Error('Conflict') as any;
       error409.status = 409;
@@ -314,6 +351,7 @@ describe('Docs Forwardport Action Tests', () => {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [{ type: 'file', path: 'vcluster/existing.mdx' }] })
               .mockResolvedValueOnce({ data: { sha: 'conflict-sha' } }),
             createOrUpdateFileContents: jest.fn()
               .mockRejectedValueOnce(error409)
